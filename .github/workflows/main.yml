@@ -1,0 +1,415 @@
+
+name: Temporary Cloud AI Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Select AI model"
+        type: choice
+        required: true
+        default: qwen2.5:0.5b
+        options:
+          - qwen2.5:0.5b
+          - smollm2:1.7b
+
+      session_minutes:
+        description: "Session duration"
+        type: choice
+        required: true
+        default: "25"
+        options:
+          - "10"
+          - "15"
+          - "20"
+          - "25"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-cloud-ai
+  cancel-in-progress: true
+
+jobs:
+  ai-server:
+    name: Start Temporary Cloud AI
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl python3
+
+      - name: Verify password
+        shell: bash
+        env:
+          AI_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$AI_PASSWORD" || ${#AI_PASSWORD} -lt 12 ]]; then
+            echo "::error::Set VM_WEB_PASSWORD in repository Actions secrets (minimum 12 characters)."
+            exit 1
+          fi
+
+      - name: Install Ollama
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://ollama.com/install.sh | sh
+          ollama --version
+
+      - name: Start Ollama and download AI model
+        shell: bash
+        env:
+          AI_MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+
+          ollama serve > "$RUNNER_TEMP/ollama.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/ollama.pid"
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:11434/api/tags >/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || {
+            cat "$RUNNER_TEMP/ollama.log"
+            exit 1
+          }
+
+          ollama pull "$AI_MODEL"
+
+      - name: Create AI web interface
+        shell: bash
+        env:
+          AI_MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/cloud-ai"
+
+          cat > "$RUNNER_TEMP/cloud-ai/server.py" <<'PY'
+          import os
+          import json
+          import base64
+          import secrets
+          import urllib.request
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          PASSWORD = os.environ["AI_PASSWORD"]
+          MODEL = os.environ["AI_MODEL"]
+
+          HTML = r"""
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="UTF-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>Temporary Cloud AI</title>
+          <style>
+          *{box-sizing:border-box}
+          body{margin:0;background:#0b1020;color:#eee;font-family:Arial,sans-serif;display:flex;justify-content:center;align-items:center;min-height:100vh}
+          main{width:min(850px,96%);height:90vh;background:#151c30;border:1px solid #334155;border-radius:16px;display:flex;flex-direction:column;overflow:hidden}
+          header{padding:20px;border-bottom:1px solid #334155}
+          header h2{color:#60a5fa;margin:0}
+          header p{color:#94a3b8;font-size:13px}
+          #messages{flex:1;overflow:auto;padding:16px}
+          .msg{padding:13px;margin:10px 0;border-radius:12px;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.5}
+          .user{background:#1e3a5f;margin-left:30px}
+          .bot{background:#253047;margin-right:30px}
+          footer{padding:15px;border-top:1px solid #334155}
+          textarea{width:100%;height:85px;padding:12px;background:#0b1020;color:white;border:1px solid #475569;border-radius:9px;font-size:15px}
+          button{background:#2563eb;color:white;border:0;padding:12px 24px;margin-top:10px;border-radius:8px;cursor:pointer}
+          button:disabled{opacity:.5}
+          </style>
+          </head>
+          <body>
+          <main>
+          <header>
+          <h2>⚡ Temporary Cloud AI</h2>
+          <p>GitHub Actions • Ubuntu • Ollama</p>
+          <p>Model: MODEL_NAME</p>
+          </header>
+          <div id="messages">
+          <div class="msg bot">Hello! Your AI server is ready. Ask me anything!</div>
+          </div>
+          <footer>
+          <textarea id="prompt" placeholder="Write your message..."></textarea>
+          <button id="send" onclick="sendMessage()">Send</button>
+          <span id="status"></span>
+          </footer>
+          </main>
+          <script>
+          const messages=document.getElementById("messages");
+          const promptBox=document.getElementById("prompt");
+          const statusBox=document.getElementById("status");
+          const button=document.getElementById("send");
+          let history=[];
+
+          function addMessage(text,type){
+            let el=document.createElement("div");
+            el.className="msg "+type;
+            el.textContent=text;
+            messages.appendChild(el);
+            messages.scrollTop=messages.scrollHeight;
+            return el;
+          }
+
+          async function sendMessage(){
+            const text=promptBox.value.trim();
+            if(!text)return;
+            promptBox.value="";
+            addMessage(text,"user");
+            history.push({role:"user",content:text});
+            button.disabled=true;
+            statusBox.textContent=" AI thinking...";
+            const reply=addMessage("Generating...","bot");
+
+            try{
+              const response=await fetch("/api/chat",{
+                method:"POST",
+                headers:{"Content-Type":"application/json"},
+                body:JSON.stringify({messages:history})
+              });
+              if(!response.ok)throw new Error("HTTP "+response.status);
+              const data=await response.json();
+              reply.textContent=data.reply;
+              history.push({role:"assistant",content:data.reply});
+              statusBox.textContent=" Ready";
+            }catch(e){
+              reply.textContent="Error: "+e.message;
+              history.pop();
+              statusBox.textContent=" Error";
+            }finally{
+              button.disabled=false;
+            }
+          }
+
+          promptBox.addEventListener("keydown",e=>{
+            if(e.key==="Enter"&&!e.shiftKey){
+              e.preventDefault();
+              sendMessage();
+            }
+          });
+          </script>
+          </body>
+          </html>
+          """.replace("MODEL_NAME", MODEL)
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *args):
+                  pass
+
+              def authorized(self):
+                  header = self.headers.get("Authorization", "")
+                  if not header.startswith("Basic "):
+                      return False
+                  try:
+                      raw = base64.b64decode(header[6:], validate=True).decode()
+                      username, password = raw.split(":", 1)
+                      return username == "ai" and secrets.compare_digest(password, PASSWORD)
+                  except Exception:
+                      return False
+
+              def auth_error(self):
+                  self.send_response(401)
+                  self.send_header("WWW-Authenticate", 'Basic realm="Cloud AI"')
+                  self.end_headers()
+
+              def do_GET(self):
+                  if not self.authorized():
+                      return self.auth_error()
+                  if self.path != "/":
+                      return self.send_error(404)
+                  body = HTML.encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+              def do_POST(self):
+                  if not self.authorized():
+                      return self.auth_error()
+                  if self.path != "/api/chat":
+                      return self.send_error(404)
+
+                  try:
+                      size = int(self.headers.get("Content-Length", "0"))
+                      if size < 1 or size > 100000:
+                          return self.send_error(413)
+
+                      data = json.loads(self.rfile.read(size))
+                      messages = data.get("messages", [])
+
+                      if not isinstance(messages, list) or len(messages) > 40:
+                          return self.send_error(400)
+
+                      clean = []
+                      for msg in messages:
+                          if not isinstance(msg, dict):
+                              continue
+                          role = msg.get("role")
+                          content = msg.get("content")
+                          if role not in ("user", "assistant") or not isinstance(content, str):
+                              continue
+                          clean.append({"role": role, "content": content[:12000]})
+
+                      payload = json.dumps({
+                          "model": MODEL,
+                          "messages": clean,
+                          "stream": False
+                      }).encode()
+
+                      req = urllib.request.Request(
+                          "http://127.0.0.1:11434/api/chat",
+                          data=payload,
+                          headers={"Content-Type": "application/json"}
+                      )
+
+                      with urllib.request.urlopen(req, timeout=240) as response:
+                          result = json.loads(response.read())
+
+                      body = json.dumps({
+                          "reply": result["message"]["content"]
+                      }).encode()
+
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+
+                  except Exception:
+                      body = b'{"error":"AI request failed"}'
+                      self.send_response(500)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+
+          ThreadingHTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
+          PY
+
+      - name: Start protected AI interface
+        shell: bash
+        env:
+          AI_PASSWORD: ${{ secrets.VM_WEB_PASSWORD }}
+          AI_MODEL: ${{ inputs.model }}
+        run: |
+          set -euo pipefail
+
+          python3 "$RUNNER_TEMP/cloud-ai/server.py" \
+            > "$RUNNER_TEMP/cloud-ai/server.log" 2>&1 &
+
+          echo $! > "$RUNNER_TEMP/cloud-ai/server.pid"
+
+          READY=0
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)
+            if [[ "$CODE" == "401" ]]; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$READY" != "1" ]]; then
+            cat "$RUNNER_TEMP/cloud-ai/server.log"
+            exit 1
+          fi
+
+      - name: Install Cloudflare Tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -fsSL \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o "$RUNNER_TEMP/cloud-ai/cloudflared"
+
+          chmod 700 "$RUNNER_TEMP/cloud-ai/cloudflared"
+
+      - name: Publish AI and keep session alive
+        shell: bash
+        env:
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+        run: |
+          set -euo pipefail
+
+          CLOUDFLARED="$RUNNER_TEMP/cloud-ai/cloudflared"
+
+          "$CLOUDFLARED" tunnel \
+            --url http://127.0.0.1:8080 \
+            --no-autoupdate \
+            > "$RUNNER_TEMP/cloud-ai/tunnel.log" 2>&1 &
+
+          TUNNEL_PID=$!
+          trap 'kill "$TUNNEL_PID" 2>/dev/null || true; kill "$(cat "$RUNNER_TEMP/cloud-ai/server.pid")" 2>/dev/null || true; kill "$(cat "$RUNNER_TEMP/ollama.pid")" 2>/dev/null || true' EXIT
+
+          URL=""
+
+          for i in $(seq 1 60); do
+            URL=$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+              "$RUNNER_TEMP/cloud-ai/tunnel.log" | head -n 1 || true)
+
+            if [[ -n "$URL" ]]; then
+              break
+            fi
+
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              cat "$RUNNER_TEMP/cloud-ai/tunnel.log"
+              exit 1
+            fi
+
+            sleep 2
+          done
+
+          if [[ -z "$URL" ]]; then
+            cat "$RUNNER_TEMP/cloud-ai/tunnel.log"
+            echo "::error::Cloudflare URL was not generated."
+            exit 1
+          fi
+
+          echo "======================================"
+          echo "TEMPORARY AI SERVER READY"
+          echo "======================================"
+          echo "URL: $URL"
+          echo "Username: ai"
+          echo "Password: VM_WEB_PASSWORD secret"
+          echo "Model: ${{ inputs.model }}"
+          echo "======================================"
+
+          echo "::notice title=Temporary AI URL::$URL"
+
+          REMAINING=$((SESSION_MINUTES * 60))
+
+          while (( REMAINING > 0 )); do
+            if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+              echo "::error::Cloudflare tunnel stopped."
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat "$RUNNER_TEMP/cloud-ai/server.pid")" 2>/dev/null; then
+              echo "::error::AI web server stopped."
+              exit 1
+            fi
+
+            if ! kill -0 "$(cat "$RUNNER_TEMP/ollama.pid")" 2>/dev/null; then
+              echo "::error::Ollama stopped."
+              exit 1
+            fi
+
+            sleep 10
+            REMAINING=$((REMAINING - 10))
+          done
+
+          echo "Session expired. Shutting down AI server."
